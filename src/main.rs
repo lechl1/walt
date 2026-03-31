@@ -48,18 +48,13 @@ enum Commands {
         /// File paths (or filenames to search recursively)
         files: Vec<String>,
     },
-    /// Install a git pre-commit hook that encrypts all vaults before committing
-    Init,
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    // Init doesn't need a password.
-    if let Commands::Init = &cli.command {
-        install_pre_commit_hook();
-        return;
-    }
+    // Always ensure pre-commit hook is installed.
+    install_pre_commit_hook();
 
     let password = find_vault_password().unwrap_or_else(|e| {
         eprintln!("Error: {}", e);
@@ -109,7 +104,6 @@ fn main() {
                 edit_files(&paths, &password);
             }
         }
-        Commands::Init => unreachable!(),
     }
 }
 
@@ -295,10 +289,7 @@ fn install_pre_commit_hook() {
         Ok(o) if o.status.success() => {
             PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string())
         }
-        _ => {
-            eprintln!("Error: not a git repository");
-            std::process::exit(1);
-        }
+        _ => return, // Not a git repo, silently skip.
     };
 
     let hooks_dir = git_dir.join("hooks");
@@ -306,19 +297,32 @@ fn install_pre_commit_hook() {
     let hook_path = hooks_dir.join("pre-commit");
 
     if hook_path.exists() {
-        // Check if our hook is already installed.
         let content = fs::read_to_string(&hook_path).unwrap_or_default();
-        if content.contains(HOOK_MARKER) {
-            println!("rv pre-commit hook already installed in {}", hook_path.display());
+        if content.contains(HOOK_SCRIPT) {
+            // Already installed with correct script, nothing to do.
             return;
         }
-        // Append to existing hook.
+        if content.contains(HOOK_MARKER) {
+            // Marker present but script differs — replace the old hook section.
+            let end_marker = "# end rv pre-commit hook";
+            if let (Some(start), Some(end_pos)) = (content.find(HOOK_MARKER), content.find(end_marker)) {
+                let before = &content[..start];
+                let after = &content[end_pos + end_marker.len()..];
+                let updated = format!("{}{}{}", before.trim_end(), if before.trim_end().is_empty() { "" } else { "\n\n" }, HOOK_SCRIPT);
+                let updated = format!("{}{}", updated, after);
+                fs::write(&hook_path, format!("{}\n", updated.trim_end())).unwrap_or_else(|e| {
+                    eprintln!("Error writing {}: {}", hook_path.display(), e);
+                    std::process::exit(1);
+                });
+            }
+            return;
+        }
+        // No rv hook present — append to existing hook.
         let updated = format!("{}\n\n{}\n", content.trim_end(), HOOK_SCRIPT);
         fs::write(&hook_path, updated).unwrap_or_else(|e| {
             eprintln!("Error writing {}: {}", hook_path.display(), e);
             std::process::exit(1);
         });
-        println!("Appended rv pre-commit hook to {}", hook_path.display());
     } else {
         // Create new hook.
         let content = format!("#!/bin/sh\n\n{}\n", HOOK_SCRIPT);
@@ -337,6 +341,42 @@ fn install_pre_commit_hook() {
         perms.set_mode(0o755);
         fs::set_permissions(&hook_path, perms).ok();
     }
+
+    // Ensure .vault-password is in .gitignore.
+    ensure_gitignore_entry(&git_dir);
+}
+
+fn ensure_gitignore_entry(git_dir: &Path) {
+    let repo_root = git_dir.parent().unwrap_or(Path::new("."));
+    let gitignore_path = repo_root.join(".gitignore");
+    let entry = ".vault-password";
+
+    let content = fs::read_to_string(&gitignore_path).unwrap_or_default();
+    if content.lines().any(|l| l.trim() == entry) {
+        // Already in .gitignore.
+    } else {
+        let updated = if content.is_empty() || content.ends_with('\n') {
+            format!("{}{}\n", content, entry)
+        } else {
+            format!("{}\n{}\n", content, entry)
+        };
+        fs::write(&gitignore_path, updated).ok();
+    }
+
+    // Unstage .vault-password if it's staged.
+    Command::new("git")
+        .args(["rm", "--cached", "-f", entry])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .ok();
+    // Also handle .vault/.vault-password
+    Command::new("git")
+        .args(["rm", "--cached", "-rf", ".vault/.vault-password"])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .ok();
 }
 
 fn is_binary_file(path: &Path) -> bool {
