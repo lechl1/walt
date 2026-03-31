@@ -1,0 +1,18 @@
+[package]
+name = "rs-vault"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rv"
+path = "src/main.rs"
+
+[dependencies]
+aes = "0.8"
+clap = { version = "4", features = ["derive"] }
+ctr = "0.9"
+hex = "0.4"
+hmac = "0.12"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+walkdir = "2"
