@@ -19,7 +19,7 @@ const IV_LENGTH: usize = 16;
 const SALT_LENGTH: usize = 32;
 
 #[derive(Parser)]
-#[command(name = "rv", about = "Ansible Vault compatible encrypt/decrypt tool")]
+#[command(name = "walt", about = "Ansible Vault compatible encrypt/decrypt tool")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
