@@ -65,16 +65,24 @@ fn main() {
         Commands::Encrypt { file, strict } => match file {
             Some(f) => {
                 let path = resolve_file(&f);
-                encrypt_file(&path, &password, strict);
-                println!("Encrypted {}", path.display());
+                if path.is_dir() {
+                    encrypt_dir(&path, &password);
+                } else {
+                    encrypt_file(&path, &password, strict);
+                    println!("Encrypted {}", path.display());
+                }
             }
             None => encrypt_all(&password),
         },
         Commands::Decrypt { file, strict } => match file {
             Some(f) => {
                 let path = resolve_file(&f);
-                decrypt_file(&path, &password, strict);
-                println!("Decrypted {}", path.display());
+                if path.is_dir() {
+                    decrypt_dir(&path, &password);
+                } else {
+                    decrypt_file(&path, &password, strict);
+                    println!("Decrypted {}", path.display());
+                }
             }
             None => decrypt_all(&password),
         },
@@ -205,13 +213,9 @@ fn find_vault_dir() -> Option<PathBuf> {
     None
 }
 
-fn encrypt_all(password: &str) {
-    let vault_dir = find_vault_dir().unwrap_or_else(|| {
-        eprintln!("Error: no .vault directory found");
-        std::process::exit(1);
-    });
+fn encrypt_dir(dir: &Path, password: &str) {
     let mut count = 0;
-    for entry in WalkDir::new(&vault_dir)
+    for entry in WalkDir::new(dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -232,16 +236,12 @@ fn encrypt_all(password: &str) {
         println!("Encrypted {}", path.display());
         count += 1;
     }
-    println!("Encrypted {} files in {}", count, vault_dir.display());
+    println!("Encrypted {} files in {}", count, dir.display());
 }
 
-fn decrypt_all(password: &str) {
-    let vault_dir = find_vault_dir().unwrap_or_else(|| {
-        eprintln!("Error: no .vault directory found");
-        std::process::exit(1);
-    });
+fn decrypt_dir(dir: &Path, password: &str) {
     let mut count = 0;
-    for entry in WalkDir::new(&vault_dir)
+    for entry in WalkDir::new(dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
@@ -258,7 +258,23 @@ fn decrypt_all(password: &str) {
             }
         }
     }
-    println!("Decrypted {} files in {}", count, vault_dir.display());
+    println!("Decrypted {} files in {}", count, dir.display());
+}
+
+fn encrypt_all(password: &str) {
+    let vault_dir = find_vault_dir().unwrap_or_else(|| {
+        eprintln!("Error: no .vault directory found");
+        std::process::exit(1);
+    });
+    encrypt_dir(&vault_dir, password);
+}
+
+fn decrypt_all(password: &str) {
+    let vault_dir = find_vault_dir().unwrap_or_else(|| {
+        eprintln!("Error: no .vault directory found");
+        std::process::exit(1);
+    });
+    decrypt_dir(&vault_dir, password);
 }
 
 // --- Pre-commit hook installation ---
