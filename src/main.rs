@@ -34,6 +34,29 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize vault directory structure
+    Init {
+        /// Directory path (defaults to current directory)
+        #[arg(default_value = ".")]
+        directory: String,
+        /// Exit with code 0 if vault already exists
+        #[arg(long)]
+        ignore_existing: bool,
+        /// Environments to initialize (comma-separated, e.g., "dev,prod")
+        #[arg(short = 'e', long)]
+        env: Option<String>,
+    },
+    /// Add a file to vault from stdin and encrypt it
+    Add {
+        /// File name (will be placed at <name>/<env>/<file>)
+        file: String,
+        /// Vault names (comma-separated, e.g., "creeper")
+        #[arg(long)]
+        name: String,
+        /// Environments (comma-separated, e.g., "prod,dev")
+        #[arg(long)]
+        env: String,
+    },
     /// Encrypt a file (or all vault files recursively if no file given)
     Encrypt {
         /// File path (or filename to search recursively)
@@ -75,6 +98,16 @@ fn main() {
     install_pre_commit_hook();
 
     match cli.command {
+        Commands::Init {
+            directory,
+            ignore_existing,
+            env,
+        } => {
+            handle_init(&directory, ignore_existing, env);
+        }
+        Commands::Add { file, name, env } => {
+            handle_add(&file, &name, &env);
+        }
         Commands::Password { action } => {
             handle_password_command(&cli.name, &cli.env, action);
         }
@@ -143,6 +176,226 @@ fn load_password(name: &Option<String>, env: &Option<String>) -> Zeroizing<Strin
     })
 }
 
+// --- Init command ---
+
+fn handle_init(directory: &str, ignore_existing: bool, env_str: Option<String>) {
+    let base_path = PathBuf::from(directory);
+    let vault_base = base_path.join(".vault");
+
+    let vault_exists = vault_base.exists() && vault_base.is_dir();
+
+    // Check if vault already exists
+    if vault_exists {
+        if ignore_existing {
+            println!("Vault already exists at {}", vault_base.display());
+            // Still check for missing passwords
+            check_and_create_missing_passwords(&vault_base, env_str);
+            return;
+        } else {
+            eprintln!("Error: vault already exists at {}", vault_base.display());
+            std::process::exit(1);
+        }
+    }
+
+    // Create the base .vault directory
+    if let Err(e) = fs::create_dir_all(&vault_base) {
+        eprintln!("Error creating vault directory: {}", e);
+        std::process::exit(1);
+    }
+
+    // Parse and create environments
+    let environments = if let Some(ref env_str) = env_str {
+        env_str.split(',').map(|s| s.trim().to_string()).collect()
+    } else {
+        vec![]
+    };
+
+    for env_name in &environments {
+        let env_dir = vault_base.join(env_name);
+        if let Err(e) = fs::create_dir_all(&env_dir) {
+            eprintln!("Error creating environment directory {}: {}", env_dir.display(), e);
+            std::process::exit(1);
+        }
+
+        // Check if password file already exists
+        let password_file = env_dir.join(".vault-password");
+        if !password_file.exists() {
+            // Prompt for password
+            let password = prompt_for_password(env_name);
+            if let Err(e) = fs::write(&password_file, &password) {
+                eprintln!("Error writing password file {}: {}", password_file.display(), e);
+                std::process::exit(1);
+            }
+        }
+
+        println!("Initialized environment '{}' at {}", env_name, env_dir.display());
+    }
+
+    if environments.is_empty() {
+        println!("Initialized vault at {}", vault_base.display());
+    } else {
+        println!("Vault initialized at {}", vault_base.display());
+    }
+
+    // Check for and create any missing passwords
+    check_and_create_missing_passwords(&vault_base, env_str);
+}
+
+fn prompt_for_password(env_name: &str) -> String {
+    if env_name == "dev" {
+        "dev".to_string()
+    } else {
+        // For non-dev environments, either generate a random one or prompt
+        // We'll generate a random one for consistency
+        generate_random_password()
+    }
+}
+
+fn check_and_create_missing_passwords(vault_base: &Path, env_str: Option<String>) {
+    let envs_to_check: Vec<String> = if let Some(env_str) = env_str {
+        env_str.split(',').map(|s| s.trim().to_string()).collect()
+    } else {
+        // Discover environments by looking at directories in .vault
+        match fs::read_dir(vault_base) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.path().is_dir()
+                        && entry
+                            .path()
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .map(|name| !name.starts_with('.'))
+                            .unwrap_or(false)
+                })
+                .filter_map(|entry| entry.path().file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+                .collect(),
+            Err(_) => vec![],
+        }
+    };
+
+    for env_name in envs_to_check {
+        let env_dir = vault_base.join(&env_name);
+        let password_file = env_dir.join(".vault-password");
+
+        if !password_file.exists() {
+            // Create the directory if it doesn't exist
+            if let Err(e) = fs::create_dir_all(&env_dir) {
+                eprintln!(
+                    "Warning: could not create environment directory {}: {}",
+                    env_dir.display(),
+                    e
+                );
+                continue;
+            }
+
+            // Prompt for password
+            let password = prompt_for_password(&env_name);
+            if let Err(e) = fs::write(&password_file, &password) {
+                eprintln!(
+                    "Warning: could not write password file {}: {}",
+                    password_file.display(),
+                    e
+                );
+            } else {
+                println!(
+                    "Created missing password file for environment '{}'",
+                    env_name
+                );
+            }
+        }
+    }
+}
+
+fn generate_random_password() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Simple random password generation using system time and a counter
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+
+    // Create a reasonably random string
+    format!(
+        "{:08x}{:08x}",
+        nanos,
+        nanos.wrapping_mul(2654435761).rotate_right(16)
+    )
+}
+
+// --- Add command ---
+
+fn handle_add(file: &str, names_str: &str, envs_str: &str) {
+    use std::io::Read;
+
+    // Read content from stdin
+    let mut content = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut content) {
+        eprintln!("Error reading from stdin: {}", e);
+        std::process::exit(1);
+    }
+
+    // Parse names and environments
+    let names: Vec<&str> = names_str.split(',').map(|s| s.trim()).collect();
+    let envs: Vec<&str> = envs_str.split(',').map(|s| s.trim()).collect();
+
+    let vault_root = find_vault_dir(&None, &None).unwrap_or_else(|| {
+        eprintln!("Error: no .vault directory found");
+        std::process::exit(1);
+    });
+
+    // For each name and env combination, add the file
+    for name in &names {
+        for env in &envs {
+            let env_dir = vault_root.join(name).join(env);
+
+            // Create directory if it doesn't exist
+            if let Err(e) = fs::create_dir_all(&env_dir) {
+                eprintln!(
+                    "Error creating directory {}: {}",
+                    env_dir.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
+
+            let file_path = env_dir.join(file);
+
+            // Write the file
+            if let Err(e) = fs::write(&file_path, &content) {
+                eprintln!("Error writing {}: {}", file_path.display(), e);
+                std::process::exit(1);
+            }
+
+            // Read the vault password from the .vault-password file
+            let vault_password_path = env_dir.join(".vault-password");
+            if !vault_password_path.exists() {
+                eprintln!(
+                    "Error: vault password file not found at {}",
+                    vault_password_path.display()
+                );
+                std::process::exit(1);
+            }
+
+            let vault_password = match read_and_maybe_decrypt_password(
+                &vault_password_path,
+                &Some(env.to_string()),
+            ) {
+                Ok(pwd) => pwd,
+                Err(e) => {
+                    eprintln!("Error reading vault password: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            // Encrypt the file using the vault password
+            encrypt_file(&file_path, &vault_password, false);
+            println!("Added and encrypted {}/{}/{}", name, env, file);
+        }
+    }
+}
+
 // --- Password commands ---
 
 fn handle_password_command(
@@ -151,6 +404,7 @@ fn handle_password_command(
     action: PasswordAction,
 ) {
     let password_path = find_vault_password_path(name, env);
+    let is_dev_env = env.as_ref().map_or(false, |e| e == "dev");
 
     match action {
         PasswordAction::Encrypt => {
@@ -162,21 +416,27 @@ fn handle_password_command(
                 eprintln!("Error: {} is already encrypted", password_path.display());
                 std::process::exit(1);
             }
-            let master_password = Zeroizing::new(
-                rpassword::prompt_password("Enter master password: ").unwrap_or_else(|e| {
-                    eprintln!("Error: {}", e);
+            let master_password = if is_dev_env {
+                Zeroizing::new("dev".to_string())
+            } else {
+                Zeroizing::new(
+                    rpassword::prompt_password("Enter master password: ").unwrap_or_else(|e| {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }),
+                )
+            };
+            if !is_dev_env {
+                let master_confirm = Zeroizing::new(
+                    rpassword::prompt_password("Confirm master password: ").unwrap_or_else(|e| {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }),
+                );
+                if *master_password != *master_confirm {
+                    eprintln!("Error: passwords do not match");
                     std::process::exit(1);
-                }),
-            );
-            let master_confirm = Zeroizing::new(
-                rpassword::prompt_password("Confirm master password: ").unwrap_or_else(|e| {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }),
-            );
-            if *master_password != *master_confirm {
-                eprintln!("Error: passwords do not match");
-                std::process::exit(1);
+                }
             }
             let encrypted = vault_encrypt(content.trim().as_bytes(), &master_password);
             fs::write(&password_path, &encrypted).unwrap_or_else(|e| {
@@ -194,12 +454,16 @@ fn handle_password_command(
                 print!("{}", content.trim());
                 return;
             }
-            let master_password = Zeroizing::new(
-                rpassword::prompt_password("Enter master password: ").unwrap_or_else(|e| {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }),
-            );
+            let master_password = if is_dev_env {
+                Zeroizing::new("dev".to_string())
+            } else {
+                Zeroizing::new(
+                    rpassword::prompt_password("Enter master password: ").unwrap_or_else(|e| {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }),
+                )
+            };
             let decrypted_bytes = vault_decrypt(&content, &master_password);
             let vault_password = String::from_utf8(decrypted_bytes).unwrap_or_else(|_| {
                 eprintln!("Error: decrypted password is not valid UTF-8");
@@ -244,7 +508,7 @@ fn find_vault_password_path(name: &Option<String>, env: &Option<String>) -> Path
 
 // --- Password discovery ---
 
-fn read_and_maybe_decrypt_password(path: &Path) -> Result<Zeroizing<String>, String> {
+fn read_and_maybe_decrypt_password(path: &Path, env: &Option<String>) -> Result<Zeroizing<String>, String> {
     let content = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
 
@@ -253,13 +517,18 @@ fn read_and_maybe_decrypt_password(path: &Path) -> Result<Zeroizing<String>, Str
     }
 
     if content.starts_with(VAULT_HEADER) {
-        let master_password = Zeroizing::new(
-            rpassword::prompt_password(format!(
-                "Enter master password for {}: ",
-                path.display()
-            ))
-            .map_err(|e| format!("Failed to read password: {}", e))?,
-        );
+        let is_dev_env = env.as_ref().map_or(false, |e| e == "dev");
+        let master_password = if is_dev_env {
+            Zeroizing::new("dev".to_string())
+        } else {
+            Zeroizing::new(
+                rpassword::prompt_password(format!(
+                    "Enter master password for {}: ",
+                    path.display()
+                ))
+                .map_err(|e| format!("Failed to read password: {}", e))?,
+            )
+        };
         let decrypted_bytes = vault_decrypt(&content, &master_password);
         let vault_password = String::from_utf8(decrypted_bytes)
             .map_err(|_| "Decrypted password is not valid UTF-8".to_string())?;
@@ -287,7 +556,7 @@ fn find_vault_password(
         })?;
         let password_path = vault_dir.join(".vault-password");
         if password_path.is_file() {
-            return read_and_maybe_decrypt_password(&password_path);
+            return read_and_maybe_decrypt_password(&password_path, env);
         }
         return Err(format!(
             "No .vault-password found at {}",
@@ -300,11 +569,11 @@ fn find_vault_password(
     loop {
         let vault_password_path = dir.join(".vault").join(".vault-password");
         if vault_password_path.is_file() {
-            return read_and_maybe_decrypt_password(&vault_password_path);
+            return read_and_maybe_decrypt_password(&vault_password_path, env);
         }
         let candidate = dir.join(".vault-password");
         if candidate.is_file() {
-            return read_and_maybe_decrypt_password(&candidate);
+            return read_and_maybe_decrypt_password(&candidate, env);
         }
         if !dir.pop() {
             break;
@@ -314,7 +583,7 @@ fn find_vault_password(
     if let Some(home) = std::env::var_os("HOME") {
         let candidate = PathBuf::from(home).join(".vault-password");
         if candidate.is_file() {
-            return read_and_maybe_decrypt_password(&candidate);
+            return read_and_maybe_decrypt_password(&candidate, env);
         }
     }
 
@@ -427,6 +696,13 @@ fn decrypt_dir(dir: &Path, password: &str) {
 
 // --- Encrypt / Decrypt all ---
 
+fn extract_env_from_vault_path(vault_dir: &PathBuf) -> Option<String> {
+    vault_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+}
+
 fn encrypt_all(name: &Option<String>, env: &Option<String>) {
     if name.is_some() || env.is_some() {
         let vault_dir = find_vault_dir(name, env).unwrap_or_else(|| {
@@ -468,7 +744,8 @@ fn encrypt_all(name: &Option<String>, env: &Option<String>) {
     } else {
         for vault_dir in &named_vault_dirs {
             let password_path = vault_dir.join(".vault-password");
-            match read_and_maybe_decrypt_password(&password_path) {
+            let extracted_env = extract_env_from_vault_path(vault_dir);
+            match read_and_maybe_decrypt_password(&password_path, &extracted_env) {
                 Ok(password) => encrypt_dir(vault_dir, &password),
                 Err(e) => eprintln!("Warning: skipping {}: {}", vault_dir.display(), e),
             }
@@ -515,7 +792,8 @@ fn decrypt_all(name: &Option<String>, env: &Option<String>) {
     } else {
         for vault_dir in &named_vault_dirs {
             let password_path = vault_dir.join(".vault-password");
-            match read_and_maybe_decrypt_password(&password_path) {
+            let extracted_env = extract_env_from_vault_path(vault_dir);
+            match read_and_maybe_decrypt_password(&password_path, &extracted_env) {
                 Ok(password) => decrypt_dir(vault_dir, &password),
                 Err(e) => eprintln!("Warning: skipping {}: {}", vault_dir.display(), e),
             }
@@ -526,7 +804,6 @@ fn decrypt_all(name: &Option<String>, env: &Option<String>) {
 // --- Pre-commit hook installation ---
 
 const HOOK_MARKER: &str = "# walt pre-commit hook";
-const HOOK_MARKER_LEGACY: &str = "# rv pre-commit hook";
 const HOOK_SCRIPT: &str = r#"# walt pre-commit hook
 # Re-encrypt .vault files and .env files (excluding local/dev) before committing
 if command -v walt >/dev/null 2>&1; then
@@ -563,21 +840,13 @@ fn install_pre_commit_hook() {
         if content.contains(HOOK_SCRIPT) {
             return;
         }
-        // Check for current or legacy marker
-        let active_marker = if content.contains(HOOK_MARKER) {
-            Some((HOOK_MARKER, "# end walt pre-commit hook"))
-        } else if content.contains(HOOK_MARKER_LEGACY) {
-            Some((HOOK_MARKER_LEGACY, "# end rv pre-commit hook"))
-        } else {
-            None
-        };
-
-        if let Some((marker, end_marker)) = active_marker {
+        // Check for current marker
+        if content.contains(HOOK_MARKER) {
             if let (Some(start), Some(end_pos)) =
-                (content.find(marker), content.find(end_marker))
+                (content.find(HOOK_MARKER), content.find("# end walt pre-commit hook"))
             {
                 let before = &content[..start];
-                let after = &content[end_pos + end_marker.len()..];
+                let after = &content[end_pos + "# end walt pre-commit hook".len()..];
                 let updated = format!(
                     "{}{}{}{}",
                     before.trim_end(),

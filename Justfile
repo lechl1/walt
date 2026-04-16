@@ -1,8 +1,8 @@
 build:
-    cargo build --release -p rs-vault --bin walt
+    cargo build --release -p walt --bin walt
 
 test:
-    cargo test -p rs-vault
+    cargo test -p walt
 
 install: build
     cp target/release/walt /usr/local/bin/walt
@@ -11,4 +11,4 @@ uninstall:
     rm -f /usr/local/bin/walt
 
 dev:
-    cargo run -p rs-vault --bin walt -- --help
+    cargo run -p walt --bin walt -- --help
