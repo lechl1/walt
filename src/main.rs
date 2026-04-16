@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
+use zeroize::Zeroizing;
 
 type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 type HmacSha256 = Hmac<Sha256>;
@@ -21,13 +22,19 @@ const SALT_LENGTH: usize = 32;
 #[derive(Parser)]
 #[command(name = "walt", about = "Ansible Vault compatible encrypt/decrypt tool")]
 struct Cli {
+    /// Vault name (uses .vault/<name>/)
+    #[arg(short = 'n', long = "name", global = true)]
+    name: Option<String>,
+    /// Environment (uses .vault/<name>/<env>/)
+    #[arg(short = 'e', long = "env", global = true)]
+    env: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Encrypt a file (or all files recursively if no file given)
+    /// Encrypt a file (or all vault files recursively if no file given)
     Encrypt {
         /// File path (or filename to search recursively)
         file: Option<String>,
@@ -48,23 +55,33 @@ enum Commands {
         /// File paths (or filenames to search recursively)
         files: Vec<String>,
     },
+    /// Manage vault password encryption
+    Password {
+        #[command(subcommand)]
+        action: PasswordAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PasswordAction {
+    /// Encrypt the .vault-password file with a master password
+    Encrypt,
+    /// Print the decrypted vault password to stdout
+    Decrypt,
 }
 
 fn main() {
     let cli = Cli::parse();
-
-    // Always ensure pre-commit hook is installed.
     install_pre_commit_hook();
 
-    let password = find_vault_password().unwrap_or_else(|e| {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
-    });
-
     match cli.command {
+        Commands::Password { action } => {
+            handle_password_command(&cli.name, &cli.env, action);
+        }
         Commands::Encrypt { file, strict } => match file {
             Some(f) => {
-                let path = resolve_file(&f);
+                let password = load_password(&cli.name, &cli.env);
+                let path = resolve_file(&f, &cli.name, &cli.env);
                 if path.is_dir() {
                     encrypt_dir(&path, &password);
                 } else {
@@ -72,11 +89,12 @@ fn main() {
                     println!("Encrypted {}", path.display());
                 }
             }
-            None => encrypt_all(&password),
+            None => encrypt_all(&cli.name, &cli.env),
         },
         Commands::Decrypt { file, strict } => match file {
             Some(f) => {
-                let path = resolve_file(&f);
+                let password = load_password(&cli.name, &cli.env);
+                let path = resolve_file(&f, &cli.name, &cli.env);
                 if path.is_dir() {
                     decrypt_dir(&path, &password);
                 } else {
@@ -84,13 +102,13 @@ fn main() {
                     println!("Decrypted {}", path.display());
                 }
             }
-            None => decrypt_all(&password),
+            None => decrypt_all(&cli.name, &cli.env),
         },
         Commands::Edit { files } => {
+            let password = load_password(&cli.name, &cli.env);
             let paths: Vec<PathBuf> = if files.is_empty() {
-                // No args: edit all files in .vault directory.
-                let vault_dir = find_vault_dir().unwrap_or_else(|| {
-                    eprintln!("Error: no .vault directory found");
+                let vault_dir = find_vault_dir(&cli.name, &cli.env).unwrap_or_else(|| {
+                    eprintln!("Error: no vault directory found");
                     std::process::exit(1);
                 });
                 WalkDir::new(&vault_dir)
@@ -100,7 +118,10 @@ fn main() {
                     .map(|e| e.into_path())
                     .collect()
             } else {
-                files.iter().map(|f| resolve_file(f)).collect()
+                files
+                    .iter()
+                    .map(|f| resolve_file(f, &cli.name, &cli.env))
+                    .collect()
             };
             if paths.is_empty() {
                 println!("No files to edit.");
@@ -115,73 +136,232 @@ fn main() {
     }
 }
 
-// --- Password discovery ---
-
-fn read_password_file(path: &Path) -> Option<String> {
-    let content = fs::read_to_string(path).ok()?;
-    let pw = content.trim().to_string();
-    if pw.is_empty() { None } else { Some(pw) }
+fn load_password(name: &Option<String>, env: &Option<String>) -> Zeroizing<String> {
+    find_vault_password(name, env).unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    })
 }
 
-fn find_vault_password() -> Result<String, String> {
+// --- Password commands ---
+
+fn handle_password_command(
+    name: &Option<String>,
+    env: &Option<String>,
+    action: PasswordAction,
+) {
+    let password_path = find_vault_password_path(name, env);
+
+    match action {
+        PasswordAction::Encrypt => {
+            let content = fs::read_to_string(&password_path).unwrap_or_else(|e| {
+                eprintln!("Error reading {}: {}", password_path.display(), e);
+                std::process::exit(1);
+            });
+            if content.starts_with(VAULT_HEADER) {
+                eprintln!("Error: {} is already encrypted", password_path.display());
+                std::process::exit(1);
+            }
+            let master_password = Zeroizing::new(
+                rpassword::prompt_password("Enter master password: ").unwrap_or_else(|e| {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }),
+            );
+            let master_confirm = Zeroizing::new(
+                rpassword::prompt_password("Confirm master password: ").unwrap_or_else(|e| {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }),
+            );
+            if *master_password != *master_confirm {
+                eprintln!("Error: passwords do not match");
+                std::process::exit(1);
+            }
+            let encrypted = vault_encrypt(content.trim().as_bytes(), &master_password);
+            fs::write(&password_path, &encrypted).unwrap_or_else(|e| {
+                eprintln!("Error writing {}: {}", password_path.display(), e);
+                std::process::exit(1);
+            });
+            println!("Encrypted {}", password_path.display());
+        }
+        PasswordAction::Decrypt => {
+            let content = fs::read_to_string(&password_path).unwrap_or_else(|e| {
+                eprintln!("Error reading {}: {}", password_path.display(), e);
+                std::process::exit(1);
+            });
+            if !content.starts_with(VAULT_HEADER) {
+                print!("{}", content.trim());
+                return;
+            }
+            let master_password = Zeroizing::new(
+                rpassword::prompt_password("Enter master password: ").unwrap_or_else(|e| {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }),
+            );
+            let decrypted_bytes = vault_decrypt(&content, &master_password);
+            let vault_password = String::from_utf8(decrypted_bytes).unwrap_or_else(|_| {
+                eprintln!("Error: decrypted password is not valid UTF-8");
+                std::process::exit(1);
+            });
+            print!("{}", vault_password.trim());
+        }
+    }
+}
+
+fn find_vault_password_path(name: &Option<String>, env: &Option<String>) -> PathBuf {
+    if let Some(vault_dir) = find_vault_dir(name, env) {
+        let path = vault_dir.join(".vault-password");
+        if path.is_file() {
+            return path;
+        }
+    }
+    if let Ok(mut dir) = std::env::current_dir() {
+        loop {
+            let candidate = dir.join(".vault").join(".vault-password");
+            if candidate.is_file() {
+                return candidate;
+            }
+            let candidate = dir.join(".vault-password");
+            if candidate.is_file() {
+                return candidate;
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = PathBuf::from(home).join(".vault-password");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    eprintln!("Error: no .vault-password file found");
+    std::process::exit(1);
+}
+
+// --- Password discovery ---
+
+fn read_and_maybe_decrypt_password(path: &Path) -> Result<Zeroizing<String>, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+
+    if content.trim().is_empty() {
+        return Err(format!("Password file is empty: {}", path.display()));
+    }
+
+    if content.starts_with(VAULT_HEADER) {
+        let master_password = Zeroizing::new(
+            rpassword::prompt_password(format!(
+                "Enter master password for {}: ",
+                path.display()
+            ))
+            .map_err(|e| format!("Failed to read password: {}", e))?,
+        );
+        let decrypted_bytes = vault_decrypt(&content, &master_password);
+        let vault_password = String::from_utf8(decrypted_bytes)
+            .map_err(|_| "Decrypted password is not valid UTF-8".to_string())?;
+        let trimmed = vault_password.trim().to_string();
+        if trimmed.is_empty() {
+            return Err("Decrypted password is empty".to_string());
+        }
+        Ok(Zeroizing::new(trimmed))
+    } else {
+        Ok(Zeroizing::new(content.trim().to_string()))
+    }
+}
+
+fn find_vault_password(
+    name: &Option<String>,
+    env: &Option<String>,
+) -> Result<Zeroizing<String>, String> {
+    // Named vault: look in the specific vault directory
+    if name.is_some() || env.is_some() {
+        let vault_dir = find_vault_dir(name, env).ok_or_else(|| {
+            format!(
+                "Vault directory not found for name={:?} env={:?}",
+                name, env
+            )
+        })?;
+        let password_path = vault_dir.join(".vault-password");
+        if password_path.is_file() {
+            return read_and_maybe_decrypt_password(&password_path);
+        }
+        return Err(format!(
+            "No .vault-password found at {}",
+            password_path.display()
+        ));
+    }
+
+    // Legacy: walk up directories
     let mut dir = std::env::current_dir().map_err(|e| e.to_string())?;
     loop {
-        // Check .vault/.vault-password first.
-        let vault_dir_candidate = dir.join(".vault").join(".vault-password");
-        if let Some(pw) = read_password_file(&vault_dir_candidate) {
-            return Ok(pw);
+        let vault_password_path = dir.join(".vault").join(".vault-password");
+        if vault_password_path.is_file() {
+            return read_and_maybe_decrypt_password(&vault_password_path);
         }
-        // Then check .vault-password in the directory itself.
         let candidate = dir.join(".vault-password");
-        if let Some(pw) = read_password_file(&candidate) {
-            return Ok(pw);
+        if candidate.is_file() {
+            return read_and_maybe_decrypt_password(&candidate);
         }
         if !dir.pop() {
             break;
         }
     }
 
-    // Fall back to $HOME/.vault-password.
     if let Some(home) = std::env::var_os("HOME") {
         let candidate = PathBuf::from(home).join(".vault-password");
         if candidate.is_file() {
-            let content = fs::read_to_string(&candidate)
-                .map_err(|e| format!("Failed to read {}: {}", candidate.display(), e))?;
-            let password = content.trim().to_string();
-            if !password.is_empty() {
-                return Ok(password);
-            }
+            return read_and_maybe_decrypt_password(&candidate);
         }
     }
 
     Err("No .vault-password file found in current/parent directories or $HOME".to_string())
 }
 
+// --- Vault directory discovery ---
+
+fn find_vault_dir(name: &Option<String>, env: &Option<String>) -> Option<PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let mut candidate = dir.join(".vault");
+        if candidate.is_dir() {
+            if let Some(n) = name {
+                candidate = candidate.join(n);
+            }
+            if let Some(e) = env {
+                candidate = candidate.join(e);
+            }
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
 // --- File resolution ---
 
-fn resolve_file(name: &str) -> PathBuf {
+fn resolve_file(name: &str, vault_name: &Option<String>, vault_env: &Option<String>) -> PathBuf {
     let path = PathBuf::from(name);
-
-    // If it exists relative to cwd, use it directly.
     if path.exists() {
         return path;
     }
-
-    // Try relative to the .vault directory.
-    if let Some(vault_dir) = find_vault_dir() {
+    if let Some(vault_dir) = find_vault_dir(vault_name, vault_env) {
         let vault_path = vault_dir.join(name);
         if vault_path.exists() {
             return vault_path;
         }
     }
-
-    // If it's an explicit path (contains separator), don't search further.
     if name.contains('/') || name.contains('\\') {
         eprintln!("Error: {} not found", name);
         std::process::exit(1);
     }
-
-    // It's just a filename — search recursively from cwd.
     for entry in WalkDir::new(".").into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             if let Some(fname) = entry.path().file_name() {
@@ -191,27 +371,11 @@ fn resolve_file(name: &str) -> PathBuf {
             }
         }
     }
-
     eprintln!("Error: {} not found recursively", name);
     std::process::exit(1);
 }
 
-// --- Encrypt / Decrypt all (only files in .vault directories) ---
-
-/// Find the nearest .vault directory by searching cwd and parents.
-fn find_vault_dir() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let candidate = dir.join(".vault");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    None
-}
+// --- Encrypt / Decrypt directory ---
 
 fn encrypt_dir(dir: &Path, password: &str) {
     let mut count = 0;
@@ -261,43 +425,125 @@ fn decrypt_dir(dir: &Path, password: &str) {
     println!("Decrypted {} files in {}", count, dir.display());
 }
 
-fn encrypt_all(password: &str) {
-    let vault_dir = find_vault_dir().unwrap_or_else(|| {
+// --- Encrypt / Decrypt all ---
+
+fn encrypt_all(name: &Option<String>, env: &Option<String>) {
+    if name.is_some() || env.is_some() {
+        let vault_dir = find_vault_dir(name, env).unwrap_or_else(|| {
+            eprintln!("Error: vault directory not found");
+            std::process::exit(1);
+        });
+        let password = load_password(name, env);
+        encrypt_dir(&vault_dir, &password);
+        return;
+    }
+
+    // Auto mode: find .vault/ root and discover named vaults by .vault-password files
+    let vault_root = find_vault_dir(&None, &None).unwrap_or_else(|| {
         eprintln!("Error: no .vault directory found");
         std::process::exit(1);
     });
-    encrypt_dir(&vault_dir, password);
+
+    let mut named_vault_dirs: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(&vault_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() && is_vault_password_file(entry.path()) {
+            if let Some(parent) = entry.path().parent() {
+                if parent != vault_root {
+                    named_vault_dirs.push(parent.to_path_buf());
+                }
+            }
+        }
+    }
+
+    if named_vault_dirs.is_empty() {
+        // Legacy flat vault
+        let password = find_vault_password(&None, &None).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        });
+        encrypt_dir(&vault_root, &password);
+    } else {
+        for vault_dir in &named_vault_dirs {
+            let password_path = vault_dir.join(".vault-password");
+            match read_and_maybe_decrypt_password(&password_path) {
+                Ok(password) => encrypt_dir(vault_dir, &password),
+                Err(e) => eprintln!("Warning: skipping {}: {}", vault_dir.display(), e),
+            }
+        }
+    }
 }
 
-fn decrypt_all(password: &str) {
-    let vault_dir = find_vault_dir().unwrap_or_else(|| {
+fn decrypt_all(name: &Option<String>, env: &Option<String>) {
+    if name.is_some() || env.is_some() {
+        let vault_dir = find_vault_dir(name, env).unwrap_or_else(|| {
+            eprintln!("Error: vault directory not found");
+            std::process::exit(1);
+        });
+        let password = load_password(name, env);
+        decrypt_dir(&vault_dir, &password);
+        return;
+    }
+
+    let vault_root = find_vault_dir(&None, &None).unwrap_or_else(|| {
         eprintln!("Error: no .vault directory found");
         std::process::exit(1);
     });
-    decrypt_dir(&vault_dir, password);
+
+    let mut named_vault_dirs: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(&vault_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_type().is_file() && is_vault_password_file(entry.path()) {
+            if let Some(parent) = entry.path().parent() {
+                if parent != vault_root {
+                    named_vault_dirs.push(parent.to_path_buf());
+                }
+            }
+        }
+    }
+
+    if named_vault_dirs.is_empty() {
+        let password = find_vault_password(&None, &None).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        });
+        decrypt_dir(&vault_root, &password);
+    } else {
+        for vault_dir in &named_vault_dirs {
+            let password_path = vault_dir.join(".vault-password");
+            match read_and_maybe_decrypt_password(&password_path) {
+                Ok(password) => decrypt_dir(vault_dir, &password),
+                Err(e) => eprintln!("Warning: skipping {}: {}", vault_dir.display(), e),
+            }
+        }
+    }
 }
 
 // --- Pre-commit hook installation ---
 
-const HOOK_MARKER: &str = "# rv pre-commit hook";
-const HOOK_SCRIPT: &str = r#"# rv pre-commit hook
+const HOOK_MARKER: &str = "# walt pre-commit hook";
+const HOOK_MARKER_LEGACY: &str = "# rv pre-commit hook";
+const HOOK_SCRIPT: &str = r#"# walt pre-commit hook
 # Re-encrypt .vault files and .env files (excluding local/dev) before committing
-if command -v rv >/dev/null 2>&1; then
-    rv encrypt
+if command -v walt >/dev/null 2>&1; then
+    walt encrypt
     # Encrypt .env files that don't have "local" or "dev" in the filename
     find . \( -name target -o -name node_modules -o -name build -o -name dist \) -prune -o \( -name '*.env' -o -name '.env' -o -name '.env.*' \) -print | while read -r f; do
         case "$(basename "$f")" in
             *local*|*dev*) continue ;;
         esac
         head -1 "$f" 2>/dev/null | grep -q '^\$ANSIBLE_VAULT' && continue
-        rv encrypt "$f" 2>/dev/null && echo "Encrypted $f"
+        walt encrypt "$f" 2>/dev/null && echo "Encrypted $f"
     done
     git add -u
 fi
-# end rv pre-commit hook"#;
+# end walt pre-commit hook"#;
 
 fn install_pre_commit_hook() {
-    // Find git dir.
     let output = Command::new("git")
         .args(["rev-parse", "--git-dir"])
         .output();
@@ -305,7 +551,7 @@ fn install_pre_commit_hook() {
         Ok(o) if o.status.success() => {
             PathBuf::from(String::from_utf8_lossy(&o.stdout).trim().to_string())
         }
-        _ => return, // Not a git repo, silently skip.
+        _ => return,
     };
 
     let hooks_dir = git_dir.join("hooks");
@@ -315,41 +561,58 @@ fn install_pre_commit_hook() {
     if hook_path.exists() {
         let content = fs::read_to_string(&hook_path).unwrap_or_default();
         if content.contains(HOOK_SCRIPT) {
-            // Already installed with correct script, nothing to do.
             return;
         }
-        if content.contains(HOOK_MARKER) {
-            // Marker present but script differs — replace the old hook section.
-            let end_marker = "# end rv pre-commit hook";
-            if let (Some(start), Some(end_pos)) = (content.find(HOOK_MARKER), content.find(end_marker)) {
+        // Check for current or legacy marker
+        let active_marker = if content.contains(HOOK_MARKER) {
+            Some((HOOK_MARKER, "# end walt pre-commit hook"))
+        } else if content.contains(HOOK_MARKER_LEGACY) {
+            Some((HOOK_MARKER_LEGACY, "# end rv pre-commit hook"))
+        } else {
+            None
+        };
+
+        if let Some((marker, end_marker)) = active_marker {
+            if let (Some(start), Some(end_pos)) =
+                (content.find(marker), content.find(end_marker))
+            {
                 let before = &content[..start];
                 let after = &content[end_pos + end_marker.len()..];
-                let updated = format!("{}{}{}", before.trim_end(), if before.trim_end().is_empty() { "" } else { "\n\n" }, HOOK_SCRIPT);
-                let updated = format!("{}{}", updated, after);
-                fs::write(&hook_path, format!("{}\n", updated.trim_end())).unwrap_or_else(|e| {
-                    eprintln!("Error writing {}: {}", hook_path.display(), e);
-                    std::process::exit(1);
-                });
+                let updated = format!(
+                    "{}{}{}{}",
+                    before.trim_end(),
+                    if before.trim_end().is_empty() {
+                        ""
+                    } else {
+                        "\n\n"
+                    },
+                    HOOK_SCRIPT,
+                    after
+                );
+                fs::write(&hook_path, format!("{}\n", updated.trim_end())).unwrap_or_else(
+                    |e| {
+                        eprintln!("Error writing {}: {}", hook_path.display(), e);
+                        std::process::exit(1);
+                    },
+                );
             }
             return;
         }
-        // No rv hook present — append to existing hook.
+        // No marker present — append to existing hook.
         let updated = format!("{}\n\n{}\n", content.trim_end(), HOOK_SCRIPT);
         fs::write(&hook_path, updated).unwrap_or_else(|e| {
             eprintln!("Error writing {}: {}", hook_path.display(), e);
             std::process::exit(1);
         });
     } else {
-        // Create new hook.
         let content = format!("#!/bin/sh\n\n{}\n", HOOK_SCRIPT);
         fs::write(&hook_path, content).unwrap_or_else(|e| {
             eprintln!("Error writing {}: {}", hook_path.display(), e);
             std::process::exit(1);
         });
-        println!("Created rv pre-commit hook at {}", hook_path.display());
+        println!("Created walt pre-commit hook at {}", hook_path.display());
     }
 
-    // Make executable.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -358,7 +621,6 @@ fn install_pre_commit_hook() {
         fs::set_permissions(&hook_path, perms).ok();
     }
 
-    // Ensure .vault-password is in .gitignore.
     ensure_gitignore_entry(&git_dir);
 }
 
@@ -368,9 +630,7 @@ fn ensure_gitignore_entry(git_dir: &Path) {
     let entry = ".vault-password";
 
     let content = fs::read_to_string(&gitignore_path).unwrap_or_default();
-    if content.lines().any(|l| l.trim() == entry) {
-        // Already in .gitignore.
-    } else {
+    if !content.lines().any(|l| l.trim() == entry) {
         let updated = if content.is_empty() || content.ends_with('\n') {
             format!("{}{}\n", content, entry)
         } else {
@@ -379,20 +639,15 @@ fn ensure_gitignore_entry(git_dir: &Path) {
         fs::write(&gitignore_path, updated).ok();
     }
 
-    // Unstage .vault-password if it's staged.
-    Command::new("git")
-        .args(["rm", "--cached", "-f", entry])
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .status()
-        .ok();
-    // Also handle .vault/.vault-password
-    Command::new("git")
-        .args(["rm", "--cached", "-rf", ".vault/.vault-password"])
-        .stderr(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .status()
-        .ok();
+    // Unstage .vault-password files if staged.
+    for pattern in &[entry, ".vault/.vault-password", ".vault/**/.vault-password"] {
+        Command::new("git")
+            .args(["rm", "--cached", "-rf", pattern])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .ok();
+    }
 }
 
 fn is_binary_file(path: &Path) -> bool {
@@ -464,7 +719,6 @@ const FILE_SEPARATOR_PREFIX: &str = "# ===== rs-vault: ";
 const FILE_SEPARATOR_SUFFIX: &str = " =====";
 
 fn edit_files(paths: &[PathBuf], password: &str) {
-    // Decrypt all files and collect their contents.
     let mut entries: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     for path in paths {
         let content = fs::read_to_string(path).unwrap_or_else(|e| {
@@ -479,7 +733,6 @@ fn edit_files(paths: &[PathBuf], password: &str) {
         entries.push((path.clone(), plaintext));
     }
 
-    // Build a combined temp file with separators.
     let mut combined = String::new();
     for (path, plaintext) in &entries {
         combined.push_str(FILE_SEPARATOR_PREFIX);
@@ -520,35 +773,30 @@ fn edit_files(paths: &[PathBuf], password: &str) {
     });
     fs::remove_file(&tmp_path).ok();
 
-    // Parse the edited content back into per-file sections.
     let mut sections: Vec<(String, String)> = Vec::new();
     let mut current_path: Option<String> = None;
     let mut current_content = String::new();
 
     for line in edited.lines() {
         if line.starts_with(FILE_SEPARATOR_PREFIX) && line.ends_with(FILE_SEPARATOR_SUFFIX) {
-            // Save previous section.
             if let Some(p) = current_path.take() {
                 sections.push((p, std::mem::take(&mut current_content)));
             }
-            let path_str = &line[FILE_SEPARATOR_PREFIX.len()..line.len() - FILE_SEPARATOR_SUFFIX.len()];
+            let path_str = &line
+                [FILE_SEPARATOR_PREFIX.len()..line.len() - FILE_SEPARATOR_SUFFIX.len()];
             current_path = Some(path_str.to_string());
             current_content.clear();
-        } else {
-            if current_path.is_some() {
-                if !current_content.is_empty() {
-                    current_content.push('\n');
-                }
-                current_content.push_str(line);
+        } else if current_path.is_some() {
+            if !current_content.is_empty() {
+                current_content.push('\n');
             }
+            current_content.push_str(line);
         }
     }
-    // Save last section.
     if let Some(p) = current_path {
         sections.push((p, current_content));
     }
 
-    // Re-encrypt and write each file.
     let original_map: std::collections::HashMap<String, &[u8]> = entries
         .iter()
         .map(|(p, c)| (p.display().to_string(), c.as_slice()))
@@ -556,7 +804,6 @@ fn edit_files(paths: &[PathBuf], password: &str) {
 
     for (path_str, content) in &sections {
         let content_bytes = content.as_bytes();
-        // Check if content changed.
         if let Some(original) = original_map.get(path_str) {
             if content_bytes == *original {
                 println!("No changes: {}", path_str);
@@ -582,7 +829,10 @@ fn is_vault_password_file(path: &Path) -> bool {
 
 fn encrypt_file(path: &Path, password: &str, strict: bool) {
     if is_vault_password_file(path) {
-        eprintln!("Refusing to encrypt .vault-password file: {}", path.display());
+        eprintln!(
+            "Refusing to encrypt .vault-password file: {}",
+            path.display()
+        );
         std::process::exit(1);
     }
 
@@ -611,7 +861,10 @@ fn encrypt_file(path: &Path, password: &str, strict: bool) {
 
 fn decrypt_file(path: &Path, password: &str, strict: bool) {
     if is_vault_password_file(path) {
-        eprintln!("Refusing to decrypt .vault-password file: {}", path.display());
+        eprintln!(
+            "Refusing to decrypt .vault-password file: {}",
+            path.display()
+        );
         std::process::exit(1);
     }
 
@@ -687,7 +940,6 @@ fn vault_encrypt(plaintext: &[u8], password: &str) -> String {
     mac.update(&ciphertext);
     let hmac_result = mac.finalize().into_bytes();
 
-    // Ansible vault format: hex(salt)\nhex(hmac)\nhex(ciphertext), then hex-encode the whole thing.
     let payload = format!(
         "{}\n{}\n{}",
         hex::encode(salt),
@@ -707,7 +959,6 @@ fn vault_decrypt(content: &str, password: &str) -> Vec<u8> {
         std::process::exit(1);
     }
 
-    // Join all hex lines after the header.
     let hex_body: String = lines[1..].iter().map(|l| l.trim()).collect();
     let payload_bytes = hex::decode(&hex_body).unwrap_or_else(|e| {
         eprintln!("Error decoding vault hex: {}", e);
@@ -740,7 +991,6 @@ fn vault_decrypt(content: &str, password: &str) -> Vec<u8> {
 
     let keys = derive_key(password, &salt);
 
-    // Verify HMAC.
     let mut mac = HmacSha256::new_from_slice(&keys.hmac_key).unwrap();
     mac.update(&ciphertext);
     if mac.verify_slice(&expected_hmac).is_err() {
@@ -748,12 +998,10 @@ fn vault_decrypt(content: &str, password: &str) -> Vec<u8> {
         std::process::exit(1);
     }
 
-    // Decrypt.
     let mut plaintext = ciphertext;
     let mut cipher = Aes256Ctr::new(&keys.cipher_key.into(), &keys.iv.into());
     cipher.apply_keystream(&mut plaintext);
 
-    // Remove PKCS7 padding.
     if let Some(&pad_len) = plaintext.last() {
         let pad_len = pad_len as usize;
         if pad_len > 0 && pad_len <= 16 && plaintext.len() >= pad_len {
@@ -803,7 +1051,7 @@ mod tests {
     #[test]
     fn test_roundtrip_exact_block() {
         let password = "pw";
-        let original = [0x41u8; 16]; // Exactly one block.
+        let original = [0x41u8; 16];
         let encrypted = vault_encrypt(&original, password);
         let decrypted = vault_decrypt(&encrypted, password);
         assert_eq!(decrypted, original);
@@ -815,7 +1063,10 @@ mod tests {
         let original = b"same content every time";
         let enc1 = vault_encrypt(original, password);
         let enc2 = vault_encrypt(original, password);
-        assert_eq!(enc1, enc2, "encrypting same content twice should produce identical output");
+        assert_eq!(
+            enc1, enc2,
+            "encrypting same content twice should produce identical output"
+        );
     }
 
     #[test]
@@ -827,5 +1078,20 @@ mod tests {
         assert_eq!(lines[0].len(), 80);
         assert_eq!(lines[1].len(), 80);
         assert_eq!(lines[2].len(), 40);
+    }
+
+    #[test]
+    fn test_password_encrypt_decrypt_roundtrip() {
+        let vault_password = "my-secret-vault-password";
+        let master_password = "master-key-123";
+
+        // Encrypt the vault password with the master password
+        let encrypted = vault_encrypt(vault_password.as_bytes(), master_password);
+        assert!(encrypted.starts_with(VAULT_HEADER));
+
+        // Decrypt it back
+        let decrypted_bytes = vault_decrypt(&encrypted, master_password);
+        let decrypted = String::from_utf8(decrypted_bytes).unwrap();
+        assert_eq!(decrypted, vault_password);
     }
 }
