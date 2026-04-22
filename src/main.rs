@@ -83,6 +83,20 @@ enum Commands {
         #[command(subcommand)]
         action: PasswordAction,
     },
+    /// Ensure default .vault-password files exist for every named vault
+    ///
+    /// Walks .vault/<name>/<env>/ and creates a .vault-password file with the
+    /// default password ("dev") for each vault/environment that is missing one.
+    /// Also creates .vault/<name>/dev/.vault-password for any named vault that
+    /// has no dev environment yet. Non-dev environments are left untouched.
+    InitPasswords {
+        /// Environment name to ensure (defaults to "dev")
+        #[arg(long, default_value = "dev")]
+        env: String,
+        /// Password value to write (defaults to "dev")
+        #[arg(long, default_value = "dev")]
+        password: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -137,6 +151,9 @@ fn main() {
             }
             None => decrypt_all(&cli.name, &cli.env),
         },
+        Commands::InitPasswords { env, password } => {
+            handle_init_passwords(&env, &password);
+        }
         Commands::Edit { files } => {
             let password = load_password(&cli.name, &cli.env);
             let paths: Vec<PathBuf> = if files.is_empty() {
@@ -305,6 +322,103 @@ fn check_and_create_missing_passwords(vault_base: &Path, env_str: Option<String>
             }
         }
     }
+}
+
+/// Walk .vault/<name>/<env>/ and create a .vault-password with the given
+/// default password for every named vault that is missing one. If a named
+/// vault does not yet have an <env> subdirectory, it is created. A top-level
+/// .vault/<env>/.vault-password is also ensured (legacy flat layout).
+fn handle_init_passwords(env_name: &str, default_password: &str) {
+    let vault_root = find_vault_dir(&None, &None).unwrap_or_else(|| {
+        eprintln!("Error: no .vault directory found");
+        std::process::exit(1);
+    });
+
+    let mut created_count = 0usize;
+
+    // Legacy flat layout: .vault/<env>/.vault-password
+    let flat_env_dir = vault_root.join(env_name);
+    if flat_env_dir.is_dir() {
+        created_count += ensure_vault_password_file(&flat_env_dir, default_password);
+    }
+
+    // Named-vault layout: .vault/<name>/<env>/.vault-password
+    let name_entries = match fs::read_dir(&vault_root) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "Error reading {}: {}",
+                vault_root.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+
+    for name_entry in name_entries.filter_map(|e| e.ok()) {
+        let name_path = name_entry.path();
+        if !name_path.is_dir() {
+            continue;
+        }
+        let name_str = match name_path.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        // Skip hidden dirs and the flat-layout env dir we already handled.
+        if name_str.starts_with('.') || name_str == env_name {
+            continue;
+        }
+
+        let env_dir = name_path.join(env_name);
+        if !env_dir.exists() {
+            if let Err(e) = fs::create_dir_all(&env_dir) {
+                eprintln!(
+                    "Warning: could not create {}: {}",
+                    env_dir.display(),
+                    e
+                );
+                continue;
+            }
+        }
+        created_count += ensure_vault_password_file(&env_dir, default_password);
+    }
+
+    if created_count == 0 {
+        println!("All .vault-password files already exist.");
+    } else {
+        println!(
+            "Created {} default .vault-password file(s) for env '{}'",
+            created_count, env_name
+        );
+    }
+}
+
+fn ensure_vault_password_file(env_dir: &Path, default_password: &str) -> usize {
+    let password_path = env_dir.join(".vault-password");
+    if password_path.exists() {
+        return 0;
+    }
+    if let Err(e) = fs::write(&password_path, default_password) {
+        eprintln!(
+            "Warning: could not write {}: {}",
+            password_path.display(),
+            e
+        );
+        return 0;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(&password_path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o600);
+            let _ = fs::set_permissions(&password_path, permissions);
+        }
+    }
+
+    println!("Created {}", password_path.display());
+    1
 }
 
 fn generate_random_password() -> String {
