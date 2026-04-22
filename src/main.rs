@@ -35,16 +35,30 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize vault directory structure
+    ///
+    /// Prompts for the project name (defaults to an existing .vault/<name>/
+    /// subdirectory if present, then the git top-level directory name, then
+    /// the current directory name) and the environments (defaults to
+    /// "dev,test,prod"), then creates .vault/<name>/<env>/.vault-password for
+    /// each environment that doesn't already have one. The dev environment
+    /// receives the default password "dev"; other environments get a
+    /// generated random password. Existing password files are left untouched.
     Init {
         /// Directory path (defaults to current directory)
         #[arg(default_value = ".")]
         directory: String,
-        /// Exit with code 0 if vault already exists
-        #[arg(long)]
-        ignore_existing: bool,
-        /// Environments to initialize (comma-separated, e.g., "dev,prod")
+        /// Project name (skips the project-name prompt when set)
+        #[arg(long = "project")]
+        project_name: Option<String>,
+        /// Environments, comma-separated (skips the environments prompt)
         #[arg(short = 'e', long)]
         env: Option<String>,
+        /// Password to use for the dev environment (defaults to "dev")
+        #[arg(long)]
+        password: Option<String>,
+        /// Accept all defaults without prompting
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Add a file to vault from stdin and encrypt it
     Add {
@@ -83,20 +97,6 @@ enum Commands {
         #[command(subcommand)]
         action: PasswordAction,
     },
-    /// Ensure default .vault-password files exist for every named vault
-    ///
-    /// Walks .vault/<name>/<env>/ and creates a .vault-password file with the
-    /// default password ("dev") for each vault/environment that is missing one.
-    /// Also creates .vault/<name>/dev/.vault-password for any named vault that
-    /// has no dev environment yet. Non-dev environments are left untouched.
-    InitPasswords {
-        /// Environment name to ensure (defaults to "dev")
-        #[arg(long, default_value = "dev")]
-        env: String,
-        /// Password value to write (defaults to "dev")
-        #[arg(long, default_value = "dev")]
-        password: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -114,10 +114,12 @@ fn main() {
     match cli.command {
         Commands::Init {
             directory,
-            ignore_existing,
+            project_name,
             env,
+            password,
+            yes,
         } => {
-            handle_init(&directory, ignore_existing, env);
+            handle_init(&directory, project_name, env, password, yes);
         }
         Commands::Add { file, name, env } => {
             handle_add(&file, &name, &env);
@@ -151,9 +153,6 @@ fn main() {
             }
             None => decrypt_all(&cli.name, &cli.env),
         },
-        Commands::InitPasswords { env, password } => {
-            handle_init_passwords(&env, &password);
-        }
         Commands::Edit { files } => {
             let password = load_password(&cli.name, &cli.env);
             let paths: Vec<PathBuf> = if files.is_empty() {
@@ -195,230 +194,170 @@ fn load_password(name: &Option<String>, env: &Option<String>) -> Zeroizing<Strin
 
 // --- Init command ---
 
-fn handle_init(directory: &str, ignore_existing: bool, env_str: Option<String>) {
+const DEFAULT_ENVIRONMENTS: &str = "dev,test,prod";
+const DEFAULT_DEV_PASSWORD: &str = "dev";
+
+fn handle_init(
+    directory: &str,
+    project_name_override: Option<String>,
+    env_override: Option<String>,
+    dev_password_override: Option<String>,
+    accept_defaults: bool,
+) {
     let base_path = PathBuf::from(directory);
     let vault_base = base_path.join(".vault");
 
-    let vault_exists = vault_base.exists() && vault_base.is_dir();
+    let default_project_name = determine_default_project_name(&base_path, &vault_base);
 
-    // Check if vault already exists
-    if vault_exists {
-        if ignore_existing {
-            println!("Vault already exists at {}", vault_base.display());
-            // Still check for missing passwords
-            check_and_create_missing_passwords(&vault_base, env_str);
-            return;
-        } else {
-            eprintln!("Error: vault already exists at {}", vault_base.display());
-            std::process::exit(1);
-        }
-    }
-
-    // Create the base .vault directory
-    if let Err(e) = fs::create_dir_all(&vault_base) {
-        eprintln!("Error creating vault directory: {}", e);
+    let project_name = match project_name_override {
+        Some(value) => value.trim().to_string(),
+        None if accept_defaults => default_project_name.clone(),
+        None => prompt_with_default("Project name", &default_project_name),
+    };
+    if project_name.is_empty() {
+        eprintln!("Error: project name cannot be empty");
         std::process::exit(1);
     }
 
-    // Parse and create environments
-    let environments = if let Some(ref env_str) = env_str {
-        env_str.split(',').map(|s| s.trim().to_string()).collect()
-    } else {
-        vec![]
+    let environments_raw = match env_override {
+        Some(value) => value,
+        None if accept_defaults => DEFAULT_ENVIRONMENTS.to_string(),
+        None => prompt_with_default("Environments (comma-separated)", DEFAULT_ENVIRONMENTS),
     };
-
-    for env_name in &environments {
-        let env_dir = vault_base.join(env_name);
-        if let Err(e) = fs::create_dir_all(&env_dir) {
-            eprintln!("Error creating environment directory {}: {}", env_dir.display(), e);
-            std::process::exit(1);
-        }
-
-        // Check if password file already exists
-        let password_file = env_dir.join(".vault-password");
-        if !password_file.exists() {
-            // Prompt for password
-            let password = prompt_for_password(env_name);
-            if let Err(e) = fs::write(&password_file, &password) {
-                eprintln!("Error writing password file {}: {}", password_file.display(), e);
-                std::process::exit(1);
-            }
-        }
-
-        println!("Initialized environment '{}' at {}", env_name, env_dir.display());
-    }
-
+    let environments: Vec<String> = environments_raw
+        .split(',')
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
     if environments.is_empty() {
-        println!("Initialized vault at {}", vault_base.display());
-    } else {
-        println!("Vault initialized at {}", vault_base.display());
-    }
-
-    // Check for and create any missing passwords
-    check_and_create_missing_passwords(&vault_base, env_str);
-}
-
-fn prompt_for_password(env_name: &str) -> String {
-    if env_name == "dev" {
-        "dev".to_string()
-    } else {
-        // For non-dev environments, either generate a random one or prompt
-        // We'll generate a random one for consistency
-        generate_random_password()
-    }
-}
-
-fn check_and_create_missing_passwords(vault_base: &Path, env_str: Option<String>) {
-    let envs_to_check: Vec<String> = if let Some(env_str) = env_str {
-        env_str.split(',').map(|s| s.trim().to_string()).collect()
-    } else {
-        // Discover environments by looking at directories in .vault
-        match fs::read_dir(vault_base) {
-            Ok(entries) => entries
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| {
-                    entry.path().is_dir()
-                        && entry
-                            .path()
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .map(|name| !name.starts_with('.'))
-                            .unwrap_or(false)
-                })
-                .filter_map(|entry| entry.path().file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
-                .collect(),
-            Err(_) => vec![],
-        }
-    };
-
-    for env_name in envs_to_check {
-        let env_dir = vault_base.join(&env_name);
-        let password_file = env_dir.join(".vault-password");
-
-        if !password_file.exists() {
-            // Create the directory if it doesn't exist
-            if let Err(e) = fs::create_dir_all(&env_dir) {
-                eprintln!(
-                    "Warning: could not create environment directory {}: {}",
-                    env_dir.display(),
-                    e
-                );
-                continue;
-            }
-
-            // Prompt for password
-            let password = prompt_for_password(&env_name);
-            if let Err(e) = fs::write(&password_file, &password) {
-                eprintln!(
-                    "Warning: could not write password file {}: {}",
-                    password_file.display(),
-                    e
-                );
-            } else {
-                println!(
-                    "Created missing password file for environment '{}'",
-                    env_name
-                );
-            }
-        }
-    }
-}
-
-/// Walk .vault/<name>/<env>/ and create a .vault-password with the given
-/// default password for every named vault that is missing one. If a named
-/// vault does not yet have an <env> subdirectory, it is created. A top-level
-/// .vault/<env>/.vault-password is also ensured (legacy flat layout).
-fn handle_init_passwords(env_name: &str, default_password: &str) {
-    let vault_root = find_vault_dir(&None, &None).unwrap_or_else(|| {
-        eprintln!("Error: no .vault directory found");
+        eprintln!("Error: at least one environment is required");
         std::process::exit(1);
-    });
+    }
+
+    let dev_password = dev_password_override.unwrap_or_else(|| DEFAULT_DEV_PASSWORD.to_string());
+
+    if let Err(error) = fs::create_dir_all(&vault_base) {
+        eprintln!("Error creating {}: {}", vault_base.display(), error);
+        std::process::exit(1);
+    }
+    let project_dir = vault_base.join(&project_name);
+    if let Err(error) = fs::create_dir_all(&project_dir) {
+        eprintln!("Error creating {}: {}", project_dir.display(), error);
+        std::process::exit(1);
+    }
 
     let mut created_count = 0usize;
-
-    // Legacy flat layout: .vault/<env>/.vault-password
-    let flat_env_dir = vault_root.join(env_name);
-    if flat_env_dir.is_dir() {
-        created_count += ensure_vault_password_file(&flat_env_dir, default_password);
-    }
-
-    // Named-vault layout: .vault/<name>/<env>/.vault-password
-    let name_entries = match fs::read_dir(&vault_root) {
-        Ok(entries) => entries,
-        Err(e) => {
+    for environment_name in &environments {
+        let environment_dir = project_dir.join(environment_name);
+        if let Err(error) = fs::create_dir_all(&environment_dir) {
             eprintln!(
-                "Error reading {}: {}",
-                vault_root.display(),
-                e
+                "Error creating {}: {}",
+                environment_dir.display(),
+                error
             );
             std::process::exit(1);
         }
-    };
 
-    for name_entry in name_entries.filter_map(|e| e.ok()) {
-        let name_path = name_entry.path();
-        if !name_path.is_dir() {
+        let password_path = environment_dir.join(".vault-password");
+        if password_path.exists() {
             continue;
         }
-        let name_str = match name_path.file_name().and_then(|n| n.to_str()) {
-            Some(s) => s,
-            None => continue,
+
+        let password_value = if environment_name == "dev" {
+            dev_password.clone()
+        } else {
+            generate_random_password()
         };
-        // Skip hidden dirs and the flat-layout env dir we already handled.
-        if name_str.starts_with('.') || name_str == env_name {
-            continue;
+
+        if let Err(error) = fs::write(&password_path, password_value.as_bytes()) {
+            eprintln!("Error writing {}: {}", password_path.display(), error);
+            std::process::exit(1);
         }
 
-        let env_dir = name_path.join(env_name);
-        if !env_dir.exists() {
-            if let Err(e) = fs::create_dir_all(&env_dir) {
-                eprintln!(
-                    "Warning: could not create {}: {}",
-                    env_dir.display(),
-                    e
-                );
-                continue;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = fs::metadata(&password_path) {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o600);
+                let _ = fs::set_permissions(&password_path, permissions);
             }
         }
-        created_count += ensure_vault_password_file(&env_dir, default_password);
+
+        println!("Created {}", password_path.display());
+        created_count += 1;
     }
 
     if created_count == 0 {
-        println!("All .vault-password files already exist.");
+        println!("Vault '{}' already initialized at {}", project_name, project_dir.display());
     } else {
         println!(
-            "Created {} default .vault-password file(s) for env '{}'",
-            created_count, env_name
+            "Vault '{}' initialized at {} with {} environment(s)",
+            project_name,
+            project_dir.display(),
+            environments.len()
         );
     }
 }
 
-fn ensure_vault_password_file(env_dir: &Path, default_password: &str) -> usize {
-    let password_path = env_dir.join(".vault-password");
-    if password_path.exists() {
-        return 0;
-    }
-    if let Err(e) = fs::write(&password_path, default_password) {
-        eprintln!(
-            "Warning: could not write {}: {}",
-            password_path.display(),
-            e
-        );
-        return 0;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(&password_path) {
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o600);
-            let _ = fs::set_permissions(&password_path, permissions);
+/// Pick the default project name: first existing .vault/<name>/ subdir, then
+/// the git top-level directory name, then the current directory name.
+fn determine_default_project_name(base_path: &Path, vault_base: &Path) -> String {
+    if vault_base.is_dir() {
+        if let Ok(entries) = fs::read_dir(vault_base) {
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let entry_path = entry.path();
+                if !entry_path.is_dir() {
+                    continue;
+                }
+                if let Some(name) = entry_path.file_name().and_then(|name| name.to_str()) {
+                    if !name.starts_with('.') {
+                        return name.to_string();
+                    }
+                }
+            }
         }
     }
 
-    println!("Created {}", password_path.display());
-    1
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(base_path)
+        .output()
+    {
+        if output.status.success() {
+            let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !toplevel.is_empty() {
+                if let Some(name) = Path::new(&toplevel).file_name().and_then(|name| name.to_str())
+                {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+
+    if let Ok(canonical) = fs::canonicalize(base_path) {
+        if let Some(name) = canonical.file_name().and_then(|name| name.to_str()) {
+            return name.to_string();
+        }
+    }
+
+    "default".to_string()
+}
+
+fn prompt_with_default(prompt_text: &str, default_value: &str) -> String {
+    use std::io::{self, Write};
+    print!("{} [{}]: ", prompt_text, default_value);
+    io::stdout().flush().ok();
+    let mut input_buffer = String::new();
+    if io::stdin().read_line(&mut input_buffer).is_err() {
+        return default_value.to_string();
+    }
+    let trimmed_input = input_buffer.trim();
+    if trimmed_input.is_empty() {
+        default_value.to_string()
+    } else {
+        trimmed_input.to_string()
+    }
 }
 
 fn generate_random_password() -> String {
