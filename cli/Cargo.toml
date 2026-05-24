@@ -1,0 +1,22 @@
+[package]
+name = "walt"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: built in its own container (modules/walt/cli/Dockerfile), installed
+# to /usr/local/bin/walt. A thin client of waltd over HTTP (WALT_URL, default
+# http://127.0.0.1:8470). Mirrors the daemon's openapi.yaml surface. Not part of
+# the top-level alloy workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

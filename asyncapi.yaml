@@ -1,0 +1,82 @@
+asyncapi: 2.6.0
+info:
+  title: walt events
+  version: 0.1.0
+  description: >
+    waltd's WebSocket event stream. A client connects to /ws/events and receives
+    one JSON message per mutation — vault (project / environment / file) or
+    ssh-key (key / authorized, merged from arthur) — so the GUI reconciles
+    without polling. Tagged by `kind`.
+servers:
+  local:
+    url: 127.0.0.1:8470
+    protocol: ws
+    description: Local waltd
+channels:
+  /ws/events:
+    description: Broadcast of project / environment / file changes.
+    subscribe:
+      operationId: receiveEvent
+      message:
+        oneOf:
+          - $ref: '#/components/messages/ProjectEvent'
+          - $ref: '#/components/messages/EnvEvent'
+          - $ref: '#/components/messages/FileEvent'
+          - $ref: '#/components/messages/KeyEvent'
+          - $ref: '#/components/messages/AuthorizedEvent'
+components:
+  messages:
+    ProjectEvent:
+      name: projectEvent
+      title: A project was created
+      payload:
+        type: object
+        required: [kind, op, project]
+        properties:
+          kind: { type: string, const: project }
+          op: { type: string, enum: [added] }
+          project: { type: string }
+    EnvEvent:
+      name: envEvent
+      title: An environment was created
+      payload:
+        type: object
+        required: [kind, op, project, env]
+        properties:
+          kind: { type: string, const: env }
+          op: { type: string, enum: [added] }
+          project: { type: string }
+          env: { type: string }
+    FileEvent:
+      name: fileEvent
+      title: A file was added / updated / removed, or the env was bulk (en|de)crypted
+      payload:
+        type: object
+        required: [kind, op, project, env]
+        properties:
+          kind: { type: string, const: file }
+          op: { type: string, enum: [added, updated, removed, encrypted, decrypted] }
+          project: { type: string }
+          env: { type: string }
+          file: { type: string, description: present for single-file ops (added/updated/removed) }
+          count: { type: integer, description: files changed, for bulk encrypted/decrypted ops }
+    KeyEvent:
+      name: keyEvent
+      title: A managed keypair was added / removed
+      payload:
+        type: object
+        required: [kind, op, id]
+        properties:
+          kind: { type: string, const: key }
+          op: { type: string, enum: [added, removed] }
+          id: { type: string, description: keypair name }
+    AuthorizedEvent:
+      name: authorizedEvent
+      title: authorized_keys mutated for a user
+      payload:
+        type: object
+        required: [kind, op, user]
+        properties:
+          kind: { type: string, const: authorized }
+          op: { type: string, enum: [added, removed] }
+          user: { type: string }

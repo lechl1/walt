@@ -1,0 +1,34 @@
+[package]
+name = "waltd"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: built in its own container (modules/walt/daemon/Dockerfile), run
+# host-native as a root systemd service. Serves the prebuilt SvelteKit GUI
+# (modules/walt/gui) from ${WALT_GUI_DIR}. Not part of the alloy workspace.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "process", "fs", "sync", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Ansible Vault 1.1 (AES256) crypto, ported from the walt CLI.
+aes = "0.8"
+ctr = "0.9"
+hmac = "0.12"
+pbkdf2 = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+zeroize = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

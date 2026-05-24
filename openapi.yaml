@@ -1,0 +1,397 @@
+openapi: 3.0.3
+info:
+  title: walt
+  version: 0.1.0
+  description: >
+    walt — the Ansible-Vault file-management daemon (waltd). Manages a vault
+    tree at ${WALT_ROOT}/.vault/<project>/<env>/<file> (the same layout walt's
+    CLI creates), encrypting/decrypting files with each environment's
+    .vault-password. Runs as a root systemd service on :8470 and serves the
+    SvelteKit GUI. It also embeds the SSH-key-management backend merged from the
+    former `arthur` daemon — managed keypairs, host keys, and per-user
+    authorized_keys, all on the local machine. This spec is the contract shared
+    by the `walt` CLI, the GUI, and the daemon. WS events: see asyncapi.yaml.
+servers:
+  - url: http://127.0.0.1:8470
+    description: Local waltd
+paths:
+  /:
+    get:
+      summary: The embedded SvelteKit management GUI (SPA shell).
+      operationId: index
+      responses:
+        '200':
+          description: HTML page
+          content:
+            text/html:
+              schema: { type: string }
+  /healthz:
+    get:
+      summary: Liveness probe.
+      operationId: healthz
+      responses:
+        '200':
+          description: alive
+          content:
+            text/plain:
+              schema: { type: string, example: ok }
+
+  /api/projects:
+    get:
+      summary: List vault projects and their environments.
+      operationId: listProjects
+      responses:
+        '200':
+          description: projects
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects:
+                    type: array
+                    items: { $ref: '#/components/schemas/Project' }
+    post:
+      summary: Initialize a project (creates env dirs + .vault-password files).
+      operationId: createProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProject' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '400': { description: invalid project name }
+
+  /api/projects/{project}/envs:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+    get:
+      summary: List a project's environments.
+      operationId: listEnvs
+      responses:
+        '200':
+          description: environments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  environments:
+                    type: array
+                    items: { $ref: '#/components/schemas/EnvInfo' }
+        '404': { description: unknown project }
+    post:
+      summary: Create an environment (with a .vault-password).
+      operationId: createEnv
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateEnv' }
+      responses:
+        '201': { description: created }
+        '400': { description: invalid name }
+        '404': { description: unknown project }
+
+  /api/projects/{project}/envs/{env}/files:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+      - { name: env, in: path, required: true, schema: { type: string } }
+    get:
+      summary: List files in an environment (.vault-password excluded).
+      operationId: listFiles
+      responses:
+        '200':
+          description: files
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  files:
+                    type: array
+                    items: { $ref: '#/components/schemas/FileInfo' }
+        '404': { description: unknown environment }
+    post:
+      summary: Add a new file, encrypting its content on write.
+      operationId: addFile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddFile' }
+      responses:
+        '201':
+          description: created (encrypted)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileInfo' }
+        '400': { description: invalid file name }
+        '404': { description: unknown environment }
+        '409': { description: a file with that name already exists }
+        '500': { description: env has no readable .vault-password }
+
+  /api/projects/{project}/envs/{env}/files/{file}:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+      - { name: env, in: path, required: true, schema: { type: string } }
+      - { name: file, in: path, required: true, schema: { type: string } }
+    get:
+      summary: Read a file's decrypted contents (for viewing/editing).
+      operationId: getFile
+      responses:
+        '200':
+          description: decrypted content
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileContent' }
+        '404': { description: no such file }
+        '500': { description: decryption failed (bad/missing password) }
+    put:
+      summary: Replace a file's contents, re-encrypting on write.
+      operationId: putFile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PutFile' }
+      responses:
+        '204': { description: saved (encrypted) }
+        '400': { description: invalid path }
+        '404': { description: unknown environment }
+    delete:
+      summary: Delete a file.
+      operationId: deleteFile
+      responses:
+        '204': { description: deleted (idempotent) }
+
+  /api/projects/{project}/envs/{env}/encrypt:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+      - { name: env, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Encrypt every plaintext file in the environment (or one).
+      operationId: encryptEnv
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BulkReq' }
+      responses:
+        '204': { description: done }
+        '404': { description: unknown environment }
+        '500': { description: env has no readable .vault-password }
+
+  /api/projects/{project}/envs/{env}/decrypt:
+    parameters:
+      - { name: project, in: path, required: true, schema: { type: string } }
+      - { name: env, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Decrypt every encrypted file in the environment (or one).
+      operationId: decryptEnv
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BulkReq' }
+      responses:
+        '204': { description: done }
+        '404': { description: unknown environment }
+        '500': { description: decryption failed (bad/missing password) }
+
+  # ---- ssh-key backend (merged from arthur) ----
+  /api/keys:
+    get:
+      summary: List managed SSH keypairs.
+      operationId: listKeys
+      responses:
+        '200':
+          description: keypairs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items: { $ref: '#/components/schemas/KeyInfo' }
+    post:
+      summary: Generate a new SSH keypair.
+      operationId: generateKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GenerateKeyRequest' }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeyInfo' }
+        '400': { description: invalid request }
+        '409': { description: a key with that name already exists }
+  /api/keys/{id}:
+    delete:
+      summary: Delete a keypair by id (its name).
+      operationId: deleteKey
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: deleted (idempotent) }
+  /api/host-keys:
+    get:
+      summary: List SSH keys already present on the host (not walt-managed).
+      description: Scans every real login user's ~/.ssh/*.pub and /etc/ssh host keys.
+      operationId: listHostKeys
+      responses:
+        '200':
+          description: host keys
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items: { $ref: '#/components/schemas/HostKey' }
+  /api/authorized:
+    get:
+      summary: List a user's authorized_keys.
+      operationId: listAuthorized
+      parameters:
+        - { name: user, in: query, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: authorized keys
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthorizedResponse' }
+        '404': { description: unknown user }
+    post:
+      summary: Add a public key to a user's authorized_keys.
+      operationId: addAuthorized
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuthorizedMutation' }
+      responses:
+        '204': { description: added }
+        '400': { description: not a valid public key }
+        '404': { description: unknown user }
+    delete:
+      summary: Remove a public key from a user's authorized_keys.
+      operationId: removeAuthorized
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AuthorizedMutation' }
+      responses:
+        '204': { description: removed (idempotent) }
+        '404': { description: unknown user }
+
+components:
+  schemas:
+    Project:
+      type: object
+      properties:
+        name: { type: string, example: creeper }
+        environments:
+          type: array
+          items: { type: string }
+          example: [dev, test, prod]
+    CreateProject:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        environments:
+          type: array
+          items: { type: string }
+          description: defaults to [dev, test, prod] when empty
+        password:
+          type: string
+          description: password for the dev env (defaults to "dev"); other envs get a random one
+    EnvInfo:
+      type: object
+      properties:
+        name: { type: string, example: prod }
+        file_count: { type: integer, example: 3 }
+        has_password: { type: boolean }
+    CreateEnv:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        password: { type: string, description: optional; dev defaults to "dev", else random }
+    FileInfo:
+      type: object
+      properties:
+        name: { type: string, example: secrets.env }
+        encrypted: { type: boolean }
+        size: { type: integer }
+    FileContent:
+      type: object
+      properties:
+        name: { type: string }
+        content: { type: string, description: decrypted plaintext }
+        encrypted: { type: boolean, description: whether the on-disk file was encrypted }
+    AddFile:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        content: { type: string, default: '' }
+    PutFile:
+      type: object
+      properties:
+        content: { type: string, default: '' }
+    BulkReq:
+      type: object
+      properties:
+        file:
+          type: string
+          description: restrict to a single file; omit to act on every file in the env
+    KeyInfo:
+      type: object
+      properties:
+        id: { type: string, description: keypair name (file stem) }
+        type: { type: string, enum: [ed25519, rsa, ecdsa] }
+        fingerprint: { type: string, example: 'SHA256:abc…' }
+        comment: { type: string }
+        public_key: { type: string, description: full authorized_keys line }
+    GenerateKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        type: { type: string, enum: [ed25519, rsa, ecdsa], default: ed25519 }
+        comment: { type: string }
+    HostKey:
+      type: object
+      properties:
+        scope: { type: string, enum: [user, host], description: user ~/.ssh vs /etc/ssh host key }
+        owner: { type: string, description: owning username, or "system" for host keys }
+        path: { type: string }
+        type: { type: string, example: ssh-ed25519 }
+        fingerprint: { type: string, example: 'SHA256:abc…' }
+        comment: { type: string }
+        public_key: { type: string }
+    AuthorizedResponse:
+      type: object
+      properties:
+        user: { type: string }
+        keys: { type: array, items: { type: string } }
+    AuthorizedMutation:
+      type: object
+      required: [user, key]
+      properties:
+        user: { type: string }
+        key: { type: string, description: full public-key line }

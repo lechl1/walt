@@ -1,1 +1,4 @@
-/target
+# Rust build output, at the root and in each crate (cli/, daemon/).
+target/
+
+# The GUI has its own .gitignore (node_modules, /build, /.svelte-kit).
