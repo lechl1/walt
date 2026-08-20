@@ -5,6 +5,10 @@
 //!     CLI creates), encrypting/decrypting files with the per-env password.
 //!  2. **ssh keys** — merged from the former `arthur` daemon: manages SSH
 //!     keypairs and per-user authorized_keys **on the local machine only**.
+//!  3. **eso** — hosts the vault tree as a remote secret store for the
+//!     Kubernetes External Secrets Operator, over ESO's webhook-provider
+//!     contract (see src/eso.rs). Read-only, and off unless WALT_ESO_TOKEN
+//!     is set.
 //!
 //! REST + WS surface (the contract — see ../openapi.yaml / ../asyncapi.yaml):
 //!   GET    /healthz                                       liveness probe
@@ -27,6 +31,10 @@
 //!   GET    /api/authorized?user=U                         list a user's authorized_keys
 //!   POST   /api/authorized                                add a key {user,key}
 //!   DELETE /api/authorized                                remove a key {user,key}
+//!   --- eso (kubernetes External Secrets Operator; needs WALT_ESO_TOKEN) ---
+//!   GET    /api/eso/{project}/{env}                        env secrets, merged
+//!   GET    /api/eso/{project}/{env}/{file}                 one file's secrets
+//!   GET    /api/eso/manifest/{project}/{env}               SecretStore + ExternalSecret
 //!   --- gui + events ---
 //!   GET    /ws/events                                     mutation broadcast
 //!   GET    /*                                             prebuilt SvelteKit SPA
@@ -34,6 +42,7 @@
 //! Runs as root (systemd) so it can manage a vault tree under any user's home
 //! and read/write any local user's ~/.ssh/authorized_keys.
 
+mod eso;
 mod vault;
 
 use std::net::SocketAddr;
@@ -175,6 +184,10 @@ async fn main() -> Result<()> {
             "/api/authorized",
             get(list_authorized).post(add_authorized).delete(remove_authorized),
         )
+        // eso backend (kubernetes External Secrets Operator, webhook provider)
+        .route("/api/eso/manifest/{project}/{env}", get(eso::get_manifest))
+        .route("/api/eso/{project}/{env}", get(eso::get_env))
+        .route("/api/eso/{project}/{env}/{file}", get(eso::get_file))
         .route("/ws/events", get(ws_handler))
         .layer(CorsLayer::permissive())
         .fallback_service(spa)
@@ -183,7 +196,11 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
-    tracing::info!(%bind, "waltd listening");
+    let eso = match std::env::var(eso::TOKEN_VAR) {
+        Ok(t) if !t.is_empty() => "enabled",
+        _ => "disabled (set WALT_ESO_TOKEN)",
+    };
+    tracing::info!(%bind, eso, "waltd listening");
     axum::serve(listener, app).await.context("serving")?;
     Ok(())
 }

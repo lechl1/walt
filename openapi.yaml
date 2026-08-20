@@ -9,8 +9,12 @@ info:
     .vault-password. Runs as a root systemd service on :8470 and serves the
     SvelteKit GUI. It also embeds the SSH-key-management backend merged from the
     former `arthur` daemon — managed keypairs, host keys, and per-user
-    authorized_keys, all on the local machine. This spec is the contract shared
-    by the `walt` CLI, the GUI, and the daemon. WS events: see asyncapi.yaml.
+    authorized_keys, all on the local machine. Finally, the /api/eso/* routes
+    host a vault environment as a remote secret store for the Kubernetes
+    External Secrets Operator, over ESO's webhook-provider contract; they serve
+    decrypted secrets and are disabled unless WALT_ESO_TOKEN is set. This spec
+    is the contract shared by the `walt` CLI, the GUI, and the daemon. WS
+    events: see asyncapi.yaml.
 servers:
   - url: http://127.0.0.1:8470
     description: Local waltd
@@ -297,8 +301,118 @@ paths:
         '204': { description: removed (idempotent) }
         '404': { description: unknown user }
 
+  /api/eso/{project}/{env}:
+    get:
+      summary: >
+        Every file in an environment, decrypted and merged into one flat map of
+        Kubernetes Secret entries. For an ESO webhook SecretStore with
+        `result.jsonPath: "$.data"`.
+      operationId: esoGetEnv
+      security: [{ esoBearer: [] }]
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: env, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: secret entries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EsoEnvSecrets' }
+        '401': { description: invalid or missing bearer token }
+        '404': { description: unknown environment }
+        '503': { description: eso backend disabled (WALT_ESO_TOKEN unset) }
+  /api/eso/{project}/{env}/{file}:
+    get:
+      summary: >
+        One vault file, decrypted into Kubernetes Secret entries. A YAML mapping
+        yields one entry per leaf (nested keys joined with '.'); anything else
+        yields a single entry keyed by the file name.
+      operationId: esoGetFile
+      security: [{ esoBearer: [] }]
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: env, in: path, required: true, schema: { type: string } }
+        - { name: file, in: path, required: true, schema: { type: string } }
+        - name: property
+          in: query
+          required: false
+          description: >
+            A single key within the file (ESO's remoteRef.property). Adds a
+            top-level `value` for `result.jsonPath: "$.value"`.
+          schema: { type: string }
+      responses:
+        '200':
+          description: secret entries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EsoFileSecrets' }
+        '401': { description: invalid or missing bearer token }
+        '404': { description: no such file or property }
+        '422': { description: decrypted file is not UTF-8 }
+        '503': { description: eso backend disabled (WALT_ESO_TOKEN unset) }
+  /api/eso/manifest/{project}/{env}:
+    get:
+      summary: >
+        Generate a ready-to-apply SecretStore + ExternalSecret pair wired to
+        this daemon. Renders only — nothing is persisted.
+      operationId: esoGetManifest
+      security: [{ esoBearer: [] }]
+      parameters:
+        - { name: project, in: path, required: true, schema: { type: string } }
+        - { name: env, in: path, required: true, schema: { type: string } }
+        - { name: namespace, in: query, schema: { type: string, default: default } }
+        - { name: secret, in: query, description: 'Secret to materialize (default: <project>-<env>)', schema: { type: string } }
+        - { name: url, in: query, description: 'waltd base URL as reachable from the cluster (default: $WALT_ESO_URL)', schema: { type: string } }
+        - { name: file, in: query, description: vault file to pull; omit to merge the whole environment, schema: { type: string } }
+        - { name: api_version, in: query, schema: { type: string, enum: [v1, v1beta1], default: v1 } }
+        - { name: refresh_interval, in: query, schema: { type: string, default: 1h } }
+      responses:
+        '200':
+          description: multi-document YAML manifest
+          content:
+            application/yaml:
+              schema: { type: string }
+        '400': { description: invalid file name or api_version }
+        '401': { description: invalid or missing bearer token }
+        '404': { description: unknown environment }
+        '503': { description: eso backend disabled (WALT_ESO_TOKEN unset) }
+
 components:
+  securitySchemes:
+    esoBearer:
+      type: http
+      scheme: bearer
+      description: >
+        Must equal the daemon's WALT_ESO_TOKEN. Applies to /api/eso/* only —
+        every other route on this daemon is unauthenticated.
   schemas:
+    EsoEnvSecrets:
+      type: object
+      properties:
+        project: { type: string }
+        env: { type: string }
+        data:
+          type: object
+          additionalProperties: { type: string }
+          description: plaintext Secret entries; ESO base64s them into the Secret
+          example: { db_user: admin, db.host: pg.internal }
+        sources:
+          type: object
+          additionalProperties: { type: string }
+          description: which vault file each key came from (collisions are last-write-wins)
+          example: { db_user: secrets.yml }
+    EsoFileSecrets:
+      type: object
+      properties:
+        project: { type: string }
+        env: { type: string }
+        file: { type: string }
+        data:
+          type: object
+          additionalProperties: { type: string }
+        value:
+          type: string
+          description: present only when ?property= was supplied
     Project:
       type: object
       properties:

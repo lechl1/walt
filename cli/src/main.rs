@@ -1,8 +1,9 @@
 //! walt — CLI for the walt daemon (waltd). Mirrors the daemon's openapi.yaml
 //! surface: an Ansible-Vault file manager (projects/environments/files) plus
 //! local SSH-key management (keypairs, host keys, authorized_keys — merged in
-//! from the former `arthur` CLI). Talks to waltd over HTTP (WALT_URL, default
-//! http://127.0.0.1:8470).
+//! from the former `arthur` CLI), plus the ESO backend that hosts a vault
+//! environment for the Kubernetes External Secrets Operator. Talks to waltd
+//! over HTTP (WALT_URL, default http://127.0.0.1:8470).
 
 use std::io::Read;
 
@@ -15,6 +16,9 @@ struct Cli {
     /// Daemon base URL. Overrides WALT_URL.
     #[arg(long, env = "WALT_URL", default_value = "http://127.0.0.1:8470")]
     url: String,
+    /// Bearer token for the eso routes — must match waltd's WALT_ESO_TOKEN.
+    #[arg(long, env = "WALT_ESO_TOKEN")]
+    eso_token: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -59,6 +63,46 @@ enum Cmd {
     Authorized(AuthCmd),
     /// List SSH keys already present on the host (not walt-managed).
     HostKeys,
+
+    // --- kubernetes (external secrets operator) ---
+    /// Inspect what waltd serves to the External Secrets Operator.
+    #[command(subcommand)]
+    Eso(EsoCmd),
+}
+
+#[derive(Subcommand)]
+enum EsoCmd {
+    /// Print the Secret entries ESO would pull (KEY=VALUE per line).
+    Get {
+        project: String,
+        env: String,
+        /// One vault file; omit to merge every file in the environment.
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Print a SecretStore + ExternalSecret manifest wired to this daemon.
+    Manifest {
+        project: String,
+        env: String,
+        /// Vault file to pull; omit to merge the whole environment.
+        #[arg(long)]
+        file: Option<String>,
+        /// Namespace for the generated objects.
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        /// Name of the Kubernetes Secret to materialize.
+        #[arg(long)]
+        secret: Option<String>,
+        /// waltd base URL as reachable from the cluster.
+        #[arg(long)]
+        cluster_url: Option<String>,
+        /// ESO API version: v1 or v1beta1.
+        #[arg(long, default_value = "v1")]
+        api_version: String,
+        /// ESO resync interval.
+        #[arg(long, default_value = "1h")]
+        refresh_interval: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -226,6 +270,38 @@ fn main() -> Result<()> {
             ensure_ok(r, "remove authorized key")?;
             println!("removed key for '{user}'");
         }
+        Cmd::Eso(EsoCmd::Get { project, env, file }) => {
+            let url = match &file {
+                Some(f) => format!("{base}/api/eso/{project}/{env}/{f}"),
+                None => format!("{base}/api/eso/{project}/{env}"),
+            };
+            let r = eso_auth(http.get(url), &cli.eso_token).send()?;
+            let v: serde_json::Value = serde_json::from_str(&ensure_body(r, "eso get")?)?;
+            for (k, val) in v["data"].as_object().cloned().unwrap_or_default() {
+                println!("{k}={}", val.as_str().unwrap_or(""));
+            }
+        }
+        Cmd::Eso(EsoCmd::Manifest {
+            project, env, file, namespace, secret, cluster_url, api_version, refresh_interval,
+        }) => {
+            let mut q: Vec<(&str, String)> = vec![
+                ("namespace", namespace),
+                ("api_version", api_version),
+                ("refresh_interval", refresh_interval),
+            ];
+            if let Some(f) = file {
+                q.push(("file", f));
+            }
+            if let Some(s) = secret {
+                q.push(("secret", s));
+            }
+            if let Some(u) = cluster_url {
+                q.push(("url", u));
+            }
+            let req = http.get(format!("{base}/api/eso/manifest/{project}/{env}")).query(&q);
+            let r = eso_auth(req, &cli.eso_token).send()?;
+            print!("{}", ensure_body(r, "eso manifest")?);
+        }
         Cmd::HostKeys => {
             let v: serde_json::Value = http.get(format!("{base}/api/host-keys")).send()?.json()?;
             for k in v["keys"].as_array().cloned().unwrap_or_default() {
@@ -241,6 +317,17 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The eso routes are bearer-authenticated; waltd 401s without this header.
+fn eso_auth(
+    req: reqwest::blocking::RequestBuilder,
+    token: &Option<String>,
+) -> reqwest::blocking::RequestBuilder {
+    match token {
+        Some(t) => req.bearer_auth(t),
+        None => req,
+    }
 }
 
 fn read_stdin() -> Result<String> {
